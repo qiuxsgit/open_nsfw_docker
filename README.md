@@ -15,7 +15,7 @@ caffe1.0.0
 #### 使用说明
 
 ##### 检测分值
-`curl -X POST -F "file=@test.jpg" http://localhost:5000/score` 
+`curl -X POST -F "file=@test.jpg" -H "api-key: xxxxxx"  http://localhost:5000/score` 
 响应：
 ```json
 {
