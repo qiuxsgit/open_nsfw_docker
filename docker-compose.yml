@@ -1,0 +1,25 @@
+
+services:
+  nsfw0:
+    image: nsfw-api:latest
+    restart: unless-stopped
+    ports:
+      - "5000:5000"
+    volumes:
+      - "/etc/open_nsfw/password.txt:/py_config/password.txt:ro"
+
+  nsfw1:
+    image: nsfw-api:latest
+    restart: unless-stopped
+    ports:
+      - "5001:5000"
+    volumes:
+      - "/etc/open_nsfw/password.txt:/py_config/password.txt:ro"
+
+  nsfw2:
+    image: nsfw-api:latest
+    restart: unless-stopped
+    ports:
+      - "5002:5000" 
+    volumes:
+      - "/etc/open_nsfw/password.txt:/py_config/password.txt:ro"
