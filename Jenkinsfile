@@ -368,8 +368,39 @@ pipeline {
             -v "${SMOKE_DIR}/password.txt":/py_config/password.txt:ro \
             "${IMAGE_LOCAL}"
 
-          PORT="$(${DOCKER} port "${NAME}" 5000/tcp | head -n 1 | sed 's/.*://')"
-          echo "容器已启动，本地端口：${PORT}"
+          # docker run -d 返回时容器可能已经崩了。先确认它还活着再取端口，
+          # 否则 docker port 报错、PORT 为空，后面 curl 一个残缺 URL，
+          # 真正的报错会被这些噪音盖住。
+          dump_and_die() {
+            echo "❌ $1"
+            echo "--- 容器状态 ---"
+            ${DOCKER} inspect -f 'ExitCode={{.State.ExitCode}} OOMKilled={{.State.OOMKilled}} Error={{.State.Error}}' "${NAME}" 2>&1 || true
+            echo "--- docker logs（含 stderr）---"
+            ${DOCKER} logs --tail=200 "${NAME}" 2>&1 || true
+            echo "----------------------------------------"
+            echo "排查提示："
+            echo "  * Permission denied / Read-only file system →"
+            echo "    镜像与降权配置不兼容（--user 10001 / --read-only），"
+            echo "    deploy/k8s/deployment.yaml 的 securityContext 要同步放宽。"
+            echo "    对照验证：去掉 --user/--read-only 再跑一次，能起来就是这个原因："
+            echo "      sudo docker run --rm -v /tmp/pw.txt:/py_config/password.txt:ro ${IMAGE_LOCAL}"
+            echo "  * Worker failed to boot →"
+            echo "    gunicorn 起 worker 时导入应用失败，日志里往上找 Traceback，"
+            echo "    多半是 caffe 加载模型失败（模型文件缺失/不可读）。"
+            echo "  * exec format error / no such file →"
+            echo "    镜像构建有问题，检查 Dockerfile 的 CMD 与 /workspace 内容。"
+            exit 1
+          }
+
+          if [ "$(${DOCKER} inspect -f '{{.State.Running}}' "${NAME}" 2>/dev/null || echo false)" != "true" ]; then
+            dump_and_die "容器启动后立即退出"
+          fi
+
+          PORT="$(${DOCKER} port "${NAME}" 5000/tcp 2>/dev/null | head -n 1 | sed 's/.*://')"
+          if [ -z "${PORT}" ]; then
+            dump_and_die "取不到映射端口（容器可能正在退出）"
+          fi
+          echo "容器运行中，本地端口：${PORT}"
 
           echo "=== 等待 /health（模型加载需要时间，最多 180s）==="
           ok=0
@@ -381,20 +412,13 @@ pipeline {
               break
             fi
             if [ "$(${DOCKER} inspect -f '{{.State.Running}}' "${NAME}" 2>/dev/null || echo false)" != "true" ]; then
-              echo "容器已退出，日志如下："
-              ${DOCKER} logs --tail=200 "${NAME}" || true
-              exit 1
+              dump_and_die "等待 /health 期间容器退出"
             fi
             i=$((i + 1))
             sleep 3
           done
           if [ "${ok}" != "1" ]; then
-            echo "❌ /health 一直不健康，容器日志："
-            ${DOCKER} logs --tail=200 "${NAME}" || true
-            echo "提示：若日志里是 Permission denied / Read-only file system，"
-            echo "     说明镜像和 deployment.yaml 的降权配置不兼容（--user 10001 / --read-only），"
-            echo "     请同步调整 deploy/k8s/deployment.yaml 的 securityContext 与本阶段的 docker run 参数。"
-            exit 1
+            dump_and_die "/health 在 180s 内始终不健康"
           fi
 
           echo "=== 用容器内的 python 调一次 /score（验证模型真的能推理）==="
