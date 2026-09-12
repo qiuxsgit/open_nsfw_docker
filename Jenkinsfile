@@ -155,11 +155,14 @@ pipeline {
     // 与原流水线一致：root 身份操作 docker
     DOCKER = 'sudo -u root docker'
 
-    // 参数必须落到 environment，否则 set -u 会报「未绑定的变量」
+    // ⚠️ 参数传进 sh 的两个坑：
+    //   1) 参数不落到 environment，sh 里引用会报「未绑定的变量」；
+    //   2) 值为空字符串时 Jenkins 干脆不导出该变量，所以 shell 侧仍要用 ${VAR:-}。
+    //   布尔参数不能写 ?:（false 会被当假值而回落成默认值），要显式判 null。
     ROLLOUT_TIMEOUT = "${params.ROLLOUT_TIMEOUT ?: '600s'}"
-    ENABLE_INGRESS  = "${params.ENABLE_INGRESS}"
+    ENABLE_INGRESS  = "${params.ENABLE_INGRESS == null ? 'true' : params.ENABLE_INGRESS}"
     BUILD_PROXY_URL = "${params.BUILD_PROXY_URL ?: ''}"
-    NO_CACHE        = "${params.NO_CACHE}"
+    NO_CACHE        = "${params.NO_CACHE == null ? 'false' : params.NO_CACHE}"
   }
 
   stages {
@@ -262,20 +265,26 @@ pipeline {
           set -eu
           echo "=== 构建镜像 ${IMAGE_FULL} ==="
 
+          # ⚠️ Jenkins 不会把「值为空字符串」的 environment 变量导出给 shell
+          #    （BUILD_PROXY_URL 默认就是空），在 set -u 下直接引用会报
+          #    「未绑定的变量 / unbound variable」并导致整个阶段失败，
+          #    所以这里统一用 ${VAR:-} 的形式取值。
+          BUILD_PROXY="${BUILD_PROXY_URL:-}"
+
           BUILD_ARGS=""
-          if [ -n "${BUILD_PROXY_URL}" ]; then
-            case "${BUILD_PROXY_URL}" in
+          if [ -n "${BUILD_PROXY}" ]; then
+            case "${BUILD_PROXY}" in
               *127.0.0.1*|*localhost*)
                 echo "BUILD_PROXY_URL 不能是 127.0.0.1/localhost：构建容器里的回环地址是容器自己。"
                 echo "请改成宿主机可达地址，例如 docker0 网关 http://172.17.0.1:7890"
                 exit 1
                 ;;
             esac
-            echo "docker build 使用代理：${BUILD_PROXY_URL}（供镜像内 apt-get / pip 使用）"
+            echo "docker build 使用代理：${BUILD_PROXY}（供镜像内 apt-get / pip 使用）"
             # http_proxy/https_proxy/no_proxy 是 docker 预定义 build-arg，
             # 无需在 Dockerfile 里声明 ARG，也不会写进镜像 history。
-            BUILD_ARGS="--build-arg http_proxy=${BUILD_PROXY_URL} \
-                        --build-arg https_proxy=${BUILD_PROXY_URL} \
+            BUILD_ARGS="--build-arg http_proxy=${BUILD_PROXY} \
+                        --build-arg https_proxy=${BUILD_PROXY} \
                         --build-arg no_proxy=127.0.0.1,localhost,192.168.1.103"
           else
             echo "未设置 BUILD_PROXY_URL：镜像内的 apt-get / pip 直连"
@@ -283,7 +292,7 @@ pipeline {
           fi
 
           CACHE_ARG=""
-          if [ "${NO_CACHE}" = "true" ]; then
+          if [ "${NO_CACHE:-false}" = "true" ]; then
             CACHE_ARG="--no-cache"
           fi
 
