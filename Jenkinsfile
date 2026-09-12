@@ -534,7 +534,7 @@ PYEOF
           else
             echo "${OUT}"
             case "${OUT}" in
-              *orbidden*|*cannot\ create\ resource*|*cannot\ get\ resource*)
+              *orbidden*|*"cannot create resource"*|*"cannot get resource"*)
                 echo "⚠️ ServiceAccount jenkins-deployer 没有 pods/exec 权限，跳过本检查。"
                 echo "   发布本身已成功（rollout status 通过说明 /health 正常）。"
                 echo "   如需启用，给该 SA 增加 pods/exec 的 create 权限，或把 SCORE_TEST 设为 false。"
