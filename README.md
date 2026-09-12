@@ -65,6 +65,11 @@ shred -u /tmp/password.txt
 
 ##### 2. Jenkins 发布
 
+流水线阶段：Checkout → Prepare → Build Image → Push Image → Deploy → Verify → Score Test → Ingress Smoke。
+docker 只用于构建和推送镜像（k8s 不构建镜像，必须先把镜像推到 registry），
+不在构建机上运行任何容器：应用是否可用一律在集群里验证 —— `rollout status` 等 readinessProbe 通过，
+再由 Score Test 阶段进 Pod 调一次 `/score`。
+
 Job 类型 `Pipeline from SCM`，Script Path = `Jenkinsfile`。前置条件同 douyin-sign：
 jenkins 用户可 `sudo -u root docker`、可直接用 `kubectl`（ServiceAccount 只对 `apps` 有权限）、
 构建机与各 Kubernetes 节点都把 `192.168.1.103:5000` 配成 insecure registry。
@@ -75,7 +80,7 @@ jenkins 用户可 `sudo -u root docker`、可直接用 `kubectl`（ServiceAccoun
 | --- | --- | --- |
 | `USE_PROXY` / `PROXY_URL` | true / `http://127.0.0.1:7890` | 拉 GitHub 代码走代理，等价于本机的 `proxy_on` |
 | `BUILD_PROXY_URL` | 空 | `docker build` 内部 apt/pip 用的代理，⚠️ 不能填 127.0.0.1 |
-| `IMAGE_SMOKE_TEST` | true | 推送前先在构建机本地跑一遍镜像并真实调用 `/score` |
+| `SCORE_TEST` | true | 发布后 `kubectl exec` 进 Pod 调一次 `/score`，验证模型真的能推理 |
 | `ROLLOUT_TIMEOUT` | 600s | 镜像约 1.7G，节点首次 pull 慢 |
 | `ENABLE_INGRESS` | true | 关掉则只保留集群内访问 |
 

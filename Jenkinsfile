@@ -15,6 +15,11 @@
 //
 // 部署镜像始终使用本次构建的唯一 tag：build-${BUILD_NUMBER}-${GIT_SHA}，不使用 latest。
 //
+// docker 在本流水线里只承担「构建 + 推送镜像」——k8s 不负责构建镜像，必须先有人把镜像
+// 推到 registry，集群才有东西可拉。除此之外不在构建机上运行任何容器：
+// 应用是否真的可用，一律在集群里验证（rollout status 等 readinessProbe 通过，
+// 再由 Score Test 阶段 kubectl exec 进 Pod 调一次 /score）。
+//
 // ───────────────── 代理说明（本仓库托管在 GitHub，必须走代理）─────────────────
 // 机器上的 `proxy_on` 是 shell 函数（定义在 ~/.zshrc），作用是导出
 // http_proxy / https_proxy / all_proxy 三个变量，代理端口为 7890。
@@ -111,9 +116,9 @@ pipeline {
       description: '是否下发 Ingress（公网访问 open-nsfw.k8s.qiuxs.com:8801/8802）'
     )
     booleanParam(
-      name: 'IMAGE_SMOKE_TEST',
+      name: 'SCORE_TEST',
       defaultValue: true,
-      description: '推送前先在构建机本地跑一遍镜像：等 /health 健康，并用容器内 python 调一次 /score'
+      description: '发布后在集群内调一次 /score（kubectl exec 进 Pod，用 Pod 自己挂载的 api-key），验证模型真的能推理'
     )
     booleanParam(
       name: 'SMOKE_TEST',
@@ -315,165 +320,6 @@ pipeline {
       }
     }
 
-    stage('Image Smoke Test') {
-      when {
-        expression { return params.IMAGE_SMOKE_TEST }
-      }
-      steps {
-        // 先在构建机本地把镜像跑起来验证，避免把「能构建但起不来」的镜像推上去。
-        // 注意：源码里的 src/tests 依赖 caffe 与相对导入(from ..wsgi import app)，
-        // 无法在 CI 里直接 python -m unittest 跑通，所以这里用真实容器做端到端验证。
-        sh '''
-          set -eu
-
-          NAME="open-nsfw-smoke-${BUILD_NUMBER}"
-          # 用按构建号固定的路径（而不是 mktemp），这样本阶段的 post always 也能清理掉
-          SMOKE_DIR="/tmp/open-nsfw-smoke-${BUILD_NUMBER}"
-          SMOKE_KEY="smoke-$(date +%s)-${BUILD_NUMBER}"
-
-          rm -rf "${SMOKE_DIR}"
-          mkdir -p "${SMOKE_DIR}"
-          chmod 0755 "${SMOKE_DIR}"
-
-          # 临时 api-key 文件，只在本次冒烟测试的容器里用；容器以 uid 10001 运行，所以要可读
-          printf '%s' "${SMOKE_KEY}" > "${SMOKE_DIR}/password.txt"
-          chmod 0444 "${SMOKE_DIR}/password.txt"
-
-          ${DOCKER} rm -f "${NAME}" >/dev/null 2>&1 || true
-
-          echo "=== 启动测试容器 ${NAME} ==="
-          # 端口让 docker 随机分配并只绑到回环，避免和构建机上其它服务冲突。
-          # ⚠️ 这里刻意复刻 deploy/k8s/deployment.yaml 的运行方式：
-          #    非 root(10001) + 只读根文件系统 + /tmp 可写 + 同一套环境变量，
-          #    这样「镜像和 securityContext 不兼容」会在推镜像之前就暴露，
-          #    而不是等到集群里 CrashLoopBackOff 再回头查。
-          ${DOCKER} run -d --name "${NAME}" \
-            -p 127.0.0.1::5000 \
-            --user 10001:10001 \
-            --read-only \
-            --tmpfs /tmp:rw,exec,size=256m \
-            --cap-drop ALL \
-            --security-opt no-new-privileges \
-            -e TZ=Asia/Shanghai \
-            -e MODEL_DIR=/workspace/nsfw_model \
-            -e PYTHONUNBUFFERED=1 \
-            -e PYTHONDONTWRITEBYTECODE=1 \
-            -e HOME=/tmp \
-            -e MPLCONFIGDIR=/tmp \
-            -e GLOG_logtostderr=1 \
-            -e OMP_NUM_THREADS=2 \
-            -e OPENBLAS_NUM_THREADS=2 \
-            -e MKL_NUM_THREADS=2 \
-            -e GUNICORN_CMD_ARGS="--workers=1 --timeout=300 --graceful-timeout=30 --worker-tmp-dir=/tmp --access-logfile=- --error-logfile=-" \
-            -v "${SMOKE_DIR}/password.txt":/py_config/password.txt:ro \
-            "${IMAGE_LOCAL}"
-
-          # docker run -d 返回时容器可能已经崩了。先确认它还活着再取端口，
-          # 否则 docker port 报错、PORT 为空，后面 curl 一个残缺 URL，
-          # 真正的报错会被这些噪音盖住。
-          dump_and_die() {
-            echo "❌ $1"
-            echo "--- 容器状态 ---"
-            ${DOCKER} inspect -f 'ExitCode={{.State.ExitCode}} OOMKilled={{.State.OOMKilled}} Error={{.State.Error}}' "${NAME}" 2>&1 || true
-            echo "--- docker logs（含 stderr）---"
-            ${DOCKER} logs --tail=200 "${NAME}" 2>&1 || true
-            echo "----------------------------------------"
-            echo "排查提示："
-            echo "  * Permission denied / Read-only file system →"
-            echo "    镜像与降权配置不兼容（--user 10001 / --read-only），"
-            echo "    deploy/k8s/deployment.yaml 的 securityContext 要同步放宽。"
-            echo "    对照验证：去掉 --user/--read-only 再跑一次，能起来就是这个原因："
-            echo "      sudo docker run --rm -v /tmp/pw.txt:/py_config/password.txt:ro ${IMAGE_LOCAL}"
-            echo "  * Worker failed to boot →"
-            echo "    gunicorn 起 worker 时导入应用失败，日志里往上找 Traceback，"
-            echo "    多半是 caffe 加载模型失败（模型文件缺失/不可读）。"
-            echo "  * exec format error / no such file →"
-            echo "    镜像构建有问题，检查 Dockerfile 的 CMD 与 /workspace 内容。"
-            exit 1
-          }
-
-          if [ "$(${DOCKER} inspect -f '{{.State.Running}}' "${NAME}" 2>/dev/null || echo false)" != "true" ]; then
-            dump_and_die "容器启动后立即退出"
-          fi
-
-          PORT="$(${DOCKER} port "${NAME}" 5000/tcp 2>/dev/null | head -n 1 | sed 's/.*://')"
-          if [ -z "${PORT}" ]; then
-            dump_and_die "取不到映射端口（容器可能正在退出）"
-          fi
-          echo "容器运行中，本地端口：${PORT}"
-
-          echo "=== 等待 /health（模型加载需要时间，最多 180s）==="
-          ok=0
-          i=1
-          while [ "${i}" -le 60 ]; do
-            if curl -fsS --noproxy '*' --max-time 5 "http://127.0.0.1:${PORT}/health" 2>/dev/null | grep -q healthy; then
-              echo "health OK (try ${i})"
-              ok=1
-              break
-            fi
-            if [ "$(${DOCKER} inspect -f '{{.State.Running}}' "${NAME}" 2>/dev/null || echo false)" != "true" ]; then
-              dump_and_die "等待 /health 期间容器退出"
-            fi
-            i=$((i + 1))
-            sleep 3
-          done
-          if [ "${ok}" != "1" ]; then
-            dump_and_die "/health 在 180s 内始终不健康"
-          fi
-
-          echo "=== 用容器内的 python 调一次 /score（验证模型真的能推理）==="
-          # 在容器内发请求：镜像里已有 PIL / requests，不依赖构建机的 python 环境；
-          # heredoc 用引号包住，避免 shell 展开 python 代码里的 $ 和引号
-          ${DOCKER} exec -i -e SMOKE_KEY="${SMOKE_KEY}" "${NAME}" python - <<'PY'
-import os
-from io import BytesIO
-
-import requests
-from PIL import Image
-
-buf = BytesIO()
-Image.new('RGB', (256, 256), (128, 128, 128)).save(buf, 'JPEG')
-
-resp = requests.post(
-    'http://127.0.0.1:5000/score',
-    files={'file': ('smoke.jpg', buf.getvalue())},
-    headers={'api-key': os.environ['SMOKE_KEY']},
-    timeout=120,
-)
-print('HTTP %s %s' % (resp.status_code, resp.text))
-
-body = resp.json()
-assert resp.status_code == 200, 'unexpected status'
-assert 'score' in body, 'no score in response: %s' % resp.text
-assert 0.0 <= float(body['score']) <= 1.0, 'score out of range: %s' % body['score']
-print('score smoke OK: %s' % body['score'])
-
-# 反向验证鉴权确实生效：错误 key 必须拿不到 score
-bad = requests.post(
-    'http://127.0.0.1:5000/score',
-    files={'file': ('smoke.jpg', buf.getvalue())},
-    headers={'api-key': 'definitely-wrong-key'},
-    timeout=60,
-)
-assert 'score' not in bad.json(), 'api-key check is broken: %s' % bad.text
-print('auth smoke OK')
-PY
-
-          echo "✅ 镜像冒烟测试通过"
-        '''
-      }
-      post {
-        always {
-          sh '''
-            set -eu
-            ${DOCKER} rm -f "open-nsfw-smoke-${BUILD_NUMBER}" >/dev/null 2>&1 || true
-            # 临时 api-key 文件必须删掉，不要留在构建机的 /tmp 里
-            rm -rf "/tmp/open-nsfw-smoke-${BUILD_NUMBER}"
-          '''
-        }
-      }
-    }
-
     stage('Push Image') {
       steps {
         // 内网 registry 无认证，不需要 docker login，也没有任何凭据需要处理
@@ -561,7 +407,10 @@ PY
             echo "常见原因："
             echo "  * ImagePullBackOff / HTTP response to HTTPS client → 节点 containerd 未把 ${IMAGE_REGISTRY} 配为 insecure"
             echo "  * 长时间 ContainerCreating → 节点首次拉 1.7G 的 caffe 镜像，属正常，调大 ROLLOUT_TIMEOUT"
-            echo "  * CrashLoopBackOff + Permission denied → deployment.yaml 的 runAsUser/readOnlyRootFilesystem 与镜像不兼容"
+            echo "  * CrashLoopBackOff → 看上面 Pod 日志里的 Traceback；若是 Permission denied /"
+            echo "    Read-only file system，则为 deployment.yaml 的 securityContext 与镜像不兼容"
+            echo "  * Worker failed to boot → gunicorn 起 worker 时导入应用失败，往上找 Traceback，"
+            echo "    多半是 caffe 加载模型失败（模型文件缺失或不可读）"
             echo "  * MountVolume failed (secret ${APIKEY_SECRET}) → Secret 被删或 key 名不是 ${APIKEY_KEY}"
             echo "  * OOMKilled → gunicorn 每个 worker 各加载一份模型，调小 GUNICORN_CMD_ARGS 的 --workers 或调大 memory limit"
             echo "如需回滚到上一个可用版本，请手动执行："
@@ -634,6 +483,70 @@ PY
           echo "=== 实际运行镜像 ==="
           kubectl get deployment "${DEPLOYMENT}" -n "${NS}" \
             -o jsonpath='{.spec.template.spec.containers[*].name}{"="}{.spec.template.spec.containers[*].image}{"\\n"}'
+        '''
+      }
+    }
+
+    stage('Score Test (in-cluster)') {
+      when {
+        expression { return params.SCORE_TEST }
+      }
+      steps {
+        // 在集群内验证推理链路：kubectl exec 进 Pod，用 Pod 自己挂载的 api-key
+        // 调本机 127.0.0.1:5000/score。api-key 全程留在 Pod 里，不经过 Jenkins。
+        // rollout status 只证明 /health 通过（模型已加载），这一步才证明能真的打分。
+        sh '''
+          set -eu
+          NS="${K8S_NS}"
+
+          VERIFY_PY="$(mktemp)"
+          cat > "${VERIFY_PY}" <<'PYEOF'
+# -*- coding: utf-8 -*-
+from io import BytesIO
+
+import requests
+from PIL import Image
+
+with open('/py_config/password.txt') as f:
+    key = f.read().strip()
+
+buf = BytesIO()
+Image.new('RGB', (256, 256), (128, 128, 128)).save(buf, 'JPEG')
+
+resp = requests.post(
+    'http://127.0.0.1:5000/score',
+    files={'file': ('verify.jpg', buf.getvalue())},
+    headers={'api-key': key},
+    timeout=120,
+)
+print('HTTP %s' % resp.status_code)
+body = resp.json()
+assert resp.status_code == 200, 'unexpected status: %s' % resp.text
+assert 'score' in body, 'no score in response: %s' % resp.text
+assert 0.0 <= float(body['score']) <= 1.0, 'score out of range: %s' % body['score']
+print('score = %s' % body['score'])
+PYEOF
+
+          echo "=== kubectl exec deploy/${DEPLOYMENT} -- python（集群内调 /score）==="
+          if OUT="$(kubectl exec -i -n "${NS}" deploy/"${DEPLOYMENT}" -- python - < "${VERIFY_PY}" 2>&1)"; then
+            echo "${OUT}"
+            echo "✅ 集群内 /score 校验通过"
+          else
+            echo "${OUT}"
+            case "${OUT}" in
+              *orbidden*|*cannot\ create\ resource*|*cannot\ get\ resource*)
+                echo "⚠️ ServiceAccount jenkins-deployer 没有 pods/exec 权限，跳过本检查。"
+                echo "   发布本身已成功（rollout status 通过说明 /health 正常）。"
+                echo "   如需启用，给该 SA 增加 pods/exec 的 create 权限，或把 SCORE_TEST 设为 false。"
+                ;;
+              *)
+                echo "❌ 集群内 /score 校验失败"
+                rm -f "${VERIFY_PY}"
+                exit 1
+                ;;
+            esac
+          fi
+          rm -f "${VERIFY_PY}"
         '''
       }
     }

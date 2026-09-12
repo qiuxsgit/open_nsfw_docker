@@ -54,15 +54,16 @@ spec:
       # 内网 registry 无认证，无需 imagePullSecrets
       # 推理请求可能较慢，给在途请求留出退出时间
       terminationGracePeriodSeconds: 60
+      # ⚠️ 关于加固程度：这个镜像基于 bvlc/caffe:cpu，一贯以 root + 可写根文件系统运行
+      #    （仓库里的 docker-compose.yml 也是如此）。CI 里曾按 uid 10001 + 只读根文件系统
+      #    启动，容器 2 秒内就退出，因此这里只保留不影响进程运行的加固项：
+      #    禁止提权、丢弃全部 capabilities、启用默认 seccomp。
+      #    想继续收紧的话一次只加一项，并用 kubectl rollout status 验证，顺序建议：
+      #      1) readOnlyRootFilesystem: true（/tmp 已经是 emptyDir，多数情况可直接通过）
+      #      2) runAsNonRoot + runAsUser/runAsGroup: 10001
+      #    任一项导致 CrashLoopBackOff，看 kubectl logs 里是否为
+      #    Permission denied / Read-only file system，是就退回上一步。
       securityContext:
-        # bvlc/caffe 镜像默认以 root 运行，这里强制降权到非 root。
-        # /workspace 下的文件是 root:root 0644/0755，非 root 用户只读即可，
-        # 模型推理过程不写任何文件（唯一的写入是 gunicorn 的 worker 临时文件 → /tmp）。
-        # 如果某天换了基础镜像导致启动失败（Permission denied），
-        # 先去掉 runAsUser/runAsGroup 再排查，不要直接关掉整段 securityContext。
-        runAsNonRoot: true
-        runAsUser: 10001
-        runAsGroup: 10001
         seccompProfile:
           type: RuntimeDefault
       affinity:
@@ -92,12 +93,10 @@ spec:
             # 日志实时输出到 stdout，kubectl logs 才看得到
             - name: PYTHONUNBUFFERED
               value: "1"
-            # 只读根文件系统下不要尝试写 .pyc
+            # 不往镜像层里写 .pyc
             - name: PYTHONDONTWRITEBYTECODE
               value: "1"
-            # 非 root 用户在镜像里没有 home，指向可写的 /tmp，避免库写 ~/.cache 失败
-            - name: HOME
-              value: /tmp
+            # matplotlib/skimage 之类的库会往 home 下写缓存，指到可写的 /tmp
             - name: MPLCONFIGDIR
               value: /tmp
             # caffe 的 glog 默认会往 /tmp 落日志文件，改为直接输出到 stderr
@@ -157,7 +156,8 @@ spec:
               memory: 2Gi
           securityContext:
             allowPrivilegeEscalation: false
-            readOnlyRootFilesystem: true
+            # 见上方说明：这个镜像还没验证过只读根文件系统，先保持可写
+            readOnlyRootFilesystem: false
             capabilities:
               drop:
                 - ALL
@@ -166,7 +166,8 @@ spec:
             - name: apikey
               mountPath: /py_config
               readOnly: true
-            # 只读根文件系统下 gunicorn worker 心跳文件、临时文件都落在这里
+            # gunicorn 的 worker 心跳文件、临时文件落在这里，
+            # 不写进容器可写层（后续启用 readOnlyRootFilesystem 时也已经就位）
             - name: tmp
               mountPath: /tmp
       volumes:
