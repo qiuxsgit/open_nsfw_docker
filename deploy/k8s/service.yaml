@@ -1,0 +1,23 @@
+# open-nsfw —— ClusterIP Service（仅集群内访问，不用 NodePort）
+# 应用监听 5000，Service 同样暴露 5000，转发到 Pod 的 http 端口。
+#
+# 集群内调用示例：
+#   curl -X POST -F "file=@test.jpg" -H "api-key: xxxxxx" \
+#     http://open-nsfw.apps.svc.cluster.local:5000/score
+apiVersion: v1
+kind: Service
+metadata:
+  name: open-nsfw
+  namespace: apps
+  labels:
+    app: open-nsfw
+    app.kubernetes.io/name: open-nsfw
+spec:
+  type: ClusterIP
+  selector:
+    app: open-nsfw
+  ports:
+    - name: http
+      protocol: TCP
+      port: 5000
+      targetPort: http

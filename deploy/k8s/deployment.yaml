@@ -1,0 +1,181 @@
+# open-nsfw —— Deployment
+#
+# 说明：
+#   - image 字段是占位镜像，⚠️ 不要直接 kubectl apply 本文件。
+#     Jenkins 的发布方式是先在本地把镜像替换成本次构建的唯一 tag 再 apply：
+#       kubectl set image -f deploy/k8s/deployment.yaml \
+#         open-nsfw=192.168.1.103:5000/open-nsfw:build-<BUILD_NUMBER>-<GIT_SHA> \
+#         --local -o yaml | kubectl apply -n apps -f -
+#     （--local 只改本地 YAML，不访问 apiserver；这样集群第一次看到 Deployment
+#       时镜像就已经是真实 tag，不会出现 PLACEHOLDER 的 ErrImagePull/ImagePullBackOff。）
+#     手动发布同理，把上面的 tag 换成仓库里实际存在的 tag。禁止使用 latest。
+#   - 镜像仓库 192.168.1.103:5000 是内网 HTTP registry、无认证，
+#     因此不需要 imagePullSecrets；但每个 Kubernetes 节点的 containerd 必须把它配置为
+#     insecure，否则会 ImagePullBackOff（报 http: server gave HTTP response to HTTPS client）。
+#   - 应用监听 5000（见 Dockerfile 的 EXPOSE 5000 与 gunicorn -b 0.0.0.0:5000）。
+#   - 健康检查接口 GET /health，来自 src/app/main.py，返回 200 + JSON。
+#
+# ⚠️ 安全前置条件：必须先创建 Secret open-nsfw-apikey（见 secret.example.yaml）。
+#    src/app/config.py 读不到 /py_config/password.txt 时 PASSWORD = None，而
+#    main.py 的校验是 request.headers.get('api-key') == config.PASSWORD ——
+#    不带 api-key 头的请求同样得到 None，会被判定为“验证通过”，接口即变成裸奔。
+#    所以 Secret 缺失时宁可不发布（Jenkinsfile 的 Prepare 阶段会直接失败）。
+#
+# ⚠️ 镜像基于 bvlc/caffe:cpu（约 1.7GB），节点首次 pull 可能需要数分钟，
+#    progressDeadlineSeconds 与 Jenkins 的 ROLLOUT_TIMEOUT 都相应放大。
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: open-nsfw
+  namespace: apps
+  labels:
+    app: open-nsfw
+    app.kubernetes.io/name: open-nsfw
+    app.kubernetes.io/component: api
+spec:
+  replicas: 2
+  revisionHistoryLimit: 5
+  # 大镜像 + 模型加载，给足发布判定时间（默认 600s，这里显式写出）
+  progressDeadlineSeconds: 900
+  selector:
+    matchLabels:
+      app: open-nsfw
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  template:
+    metadata:
+      labels:
+        app: open-nsfw
+        app.kubernetes.io/name: open-nsfw
+    spec:
+      # 内网 registry 无认证，无需 imagePullSecrets
+      # 推理请求可能较慢，给在途请求留出退出时间
+      terminationGracePeriodSeconds: 60
+      securityContext:
+        # bvlc/caffe 镜像默认以 root 运行，这里强制降权到非 root。
+        # /workspace 下的文件是 root:root 0644/0755，非 root 用户只读即可，
+        # 模型推理过程不写任何文件（唯一的写入是 gunicorn 的 worker 临时文件 → /tmp）。
+        # 如果某天换了基础镜像导致启动失败（Permission denied），
+        # 先去掉 runAsUser/runAsGroup 再排查，不要直接关掉整段 securityContext。
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      affinity:
+        podAntiAffinity:
+          # 软亲和：多节点时尽量打散；单节点集群也不会因此卡住调度
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                topologyKey: kubernetes.io/hostname
+                labelSelector:
+                  matchLabels:
+                    app: open-nsfw
+      containers:
+        - name: open-nsfw
+          # 占位镜像：由 Jenkins 的 kubectl set image 替换为本次构建的唯一镜像
+          image: 192.168.1.103:5000/open-nsfw:PLACEHOLDER_REPLACED_BY_JENKINS
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 5000
+              protocol: TCP
+          env:
+            - name: TZ
+              value: Asia/Shanghai
+            - name: MODEL_DIR
+              value: /workspace/nsfw_model
+            # 日志实时输出到 stdout，kubectl logs 才看得到
+            - name: PYTHONUNBUFFERED
+              value: "1"
+            # 只读根文件系统下不要尝试写 .pyc
+            - name: PYTHONDONTWRITEBYTECODE
+              value: "1"
+            # 非 root 用户在镜像里没有 home，指向可写的 /tmp，避免库写 ~/.cache 失败
+            - name: HOME
+              value: /tmp
+            - name: MPLCONFIGDIR
+              value: /tmp
+            # caffe 的 glog 默认会往 /tmp 落日志文件，改为直接输出到 stderr
+            - name: GLOG_logtostderr
+              value: "1"
+            # 限制 BLAS/OpenMP 线程数：容器里 caffe 会按宿主机核数开线程，
+            # 在 CPU limit 下反而因为频繁抢占而变慢。与下面的 cpu limit 对齐。
+            - name: OMP_NUM_THREADS
+              value: "2"
+            - name: OPENBLAS_NUM_THREADS
+              value: "2"
+            - name: MKL_NUM_THREADS
+              value: "2"
+            # gunicorn 19.7+ 支持 GUNICORN_CMD_ARGS，可以在不改 Dockerfile CMD 的
+            # 前提下调参。注意每个 worker 都会独立加载一份 caffe 模型（约 0.5G），
+            # 调大 workers 必须同步调大 memory limit。
+            - name: GUNICORN_CMD_ARGS
+              value: >-
+                --workers=2
+                --timeout=300
+                --graceful-timeout=30
+                --worker-tmp-dir=/tmp
+                --access-logfile=-
+                --error-logfile=-
+          # 启动探针：caffe.Net 加载模型需要时间，用 startupProbe 兜住这段，
+          # 期间不触发 liveness 重启。最长容忍 60 * 5s = 300s。
+          startupProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 5
+            timeoutSeconds: 5
+            failureThreshold: 60
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 5
+            successThreshold: 1
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 20
+            timeoutSeconds: 5
+            successThreshold: 1
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: 250m
+              memory: 768Mi
+            limits:
+              cpu: "2"
+              memory: 2Gi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          volumeMounts:
+            # api-key：config.py 硬编码读取 /py_config/password.txt
+            - name: apikey
+              mountPath: /py_config
+              readOnly: true
+            # 只读根文件系统下 gunicorn worker 心跳文件、临时文件都落在这里
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: apikey
+          secret:
+            secretName: open-nsfw-apikey
+            defaultMode: 0444
+            items:
+              - key: password.txt
+                path: password.txt
+        - name: tmp
+          emptyDir: {}
