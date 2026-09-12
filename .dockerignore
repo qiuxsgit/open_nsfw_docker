@@ -1,0 +1,28 @@
+# 构建上下文裁剪：Dockerfile 用的是 COPY . /workspace/，
+# 不排除的话 .git（含 23M 模型的历史）和部署文件都会被打进镜像。
+# ⚠️ 不要排除 src/ 、nsfw_model/ 、requirements.txt —— 运行时需要它们。
+.git
+.gitignore
+.github
+.gitee
+.idea
+.vscode
+.DS_Store
+
+# Python 构建产物
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.tox/
+venv/
+.venv/
+
+# 部署 / CI 相关，运行时用不到
+deploy/
+scripts/
+Jenkinsfile
+docker-compose*.yml
+Dockerfile*
+*.md
+LICENSE

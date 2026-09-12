@@ -1,0 +1,67 @@
+# open-nsfw —— Traefik Ingress
+#
+# 公网入口（集群已统一配置）：
+#   HTTP :  http://open-nsfw.k8s.qiuxs.com:8801
+#   HTTPS:  https://open-nsfw.k8s.qiuxs.com:8802
+#
+# Traefik 已配置全局通配符证书 *.k8s.qiuxs.com，因此这里：
+#   - 不创建 TLS Secret
+#   - 不写 spec.tls.secretName
+#   - 不使用 cert-manager
+# HTTPS 路由通过注解 router.tls=true 启用，证书由 Traefik 默认证书提供。
+#
+# 拆成两个 Ingress 的原因：router.tls 是 router 级别开关，
+# 若只写一个 Ingress 并打开 tls，web(明文) 入口会一并要求 TLS 而导致 8801 不可用。
+#
+# ⚠️ entrypoints 名称使用 Traefik 默认的 web / websecure，
+#    若你的 Traefik 自定义过 entryPoint 名称，请同步修改下面两处注解。
+#
+# ⚠️ /score 接口只靠 api-key 头鉴权，明文入口(8801)会把 key 暴露在链路上，
+#    对外只发 HTTPS 时可以把下面第一个 Ingress 删掉，或让 Jenkins 带
+#    ENABLE_INGRESS=false 发布、只保留集群内访问。
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: open-nsfw
+  namespace: apps
+  labels:
+    app: open-nsfw
+  annotations:
+    traefik.ingress.kubernetes.io/router.entrypoints: web
+spec:
+  ingressClassName: traefik
+  rules:
+    - host: open-nsfw.k8s.qiuxs.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: open-nsfw
+                port:
+                  name: http
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: open-nsfw-tls
+  namespace: apps
+  labels:
+    app: open-nsfw
+  annotations:
+    traefik.ingress.kubernetes.io/router.entrypoints: websecure
+    traefik.ingress.kubernetes.io/router.tls: "true"
+spec:
+  ingressClassName: traefik
+  rules:
+    - host: open-nsfw.k8s.qiuxs.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: open-nsfw
+                port:
+                  name: http
