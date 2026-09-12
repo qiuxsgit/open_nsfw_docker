@@ -16,12 +16,11 @@
 // 部署镜像始终使用本次构建的唯一 tag：build-${BUILD_NUMBER}-${GIT_SHA}，不使用 latest。
 //
 // ───────────────── 代理说明（本仓库托管在 GitHub，必须走代理）─────────────────
-// 本机上 `proxy_on` 是 ~/.zshrc 里的 shell 函数，等价于：
-//     export http_proxy=http://127.0.0.1:7897
-//     export https_proxy=http://127.0.0.1:7897
-//     export all_proxy=socks5://127.0.0.1:7897
+// 机器上的 `proxy_on` 是 shell 函数（定义在 ~/.zshrc），作用是导出
+// http_proxy / https_proxy / all_proxy 三个变量，代理端口为 7890。
 // Jenkins 的 sh 步骤用的是非交互 /bin/sh，读不到 zsh 函数，所以这里不调用 proxy_on，
-// 而是用同样的取值把环境变量显式注入（PROXY_URL 参数可改）。分三种情况：
+// 而是把等价的环境变量显式注入（地址由 PROXY_URL 参数控制，默认 http://127.0.0.1:7890）。
+// 分三种情况：
 //
 //   A. 拉 GitHub 代码 —— 需要代理。
 //      本文件只能控制 `checkout scm` 这一步（withEnv 注入后 git 子进程会继承）。
@@ -29,7 +28,7 @@
 //         不受本文件控制，必须在 Jenkins 里配置好，二选一：
 //           - Manage Jenkins → System → Global properties → Environment variables
 //             加 http_proxy / https_proxy / no_proxy
-//           - 或 jenkins 用户执行：git config --global http.https://github.com.proxy http://127.0.0.1:7897
+//           - 或 jenkins 用户执行：git config --global http.https://github.com.proxy http://127.0.0.1:7890
 //      ⚠️ 若仓库用 SSH 地址(git@github.com)，http_proxy 无效，需在 ~/.ssh/config 配 ProxyCommand。
 //
 //   B. 访问内网 registry / kubectl 访问 apiserver —— 绝对不能走代理。
@@ -50,7 +49,7 @@ def proxyEnv() {
   if (!useProxy) {
     return []
   }
-  def url = ((params.PROXY_URL == null) ? 'http://127.0.0.1:7897' : params.PROXY_URL).trim()
+  def url = ((params.PROXY_URL == null) ? 'http://127.0.0.1:7890' : params.PROXY_URL).trim()
   if (!url) {
     return []
   }
@@ -88,13 +87,13 @@ pipeline {
     )
     string(
       name: 'PROXY_URL',
-      defaultValue: 'http://127.0.0.1:7897',
+      defaultValue: 'http://127.0.0.1:7890',
       description: '构建机上的 HTTP 代理地址，仅用于 checkout 等需要外网的步骤'
     )
     string(
       name: 'BUILD_PROXY_URL',
       defaultValue: '',
-      description: 'docker build 容器内可达的代理地址（如 http://172.17.0.1:7897）。留空则不给 build 传代理；⚠️ 这里不能填 127.0.0.1'
+      description: 'docker build 容器内可达的代理地址（如 http://172.17.0.1:7890）。留空则不给 build 传代理；⚠️ 这里不能填 127.0.0.1'
     )
     string(
       name: 'EXTRA_NO_PROXY',
@@ -268,7 +267,7 @@ pipeline {
             case "${BUILD_PROXY_URL}" in
               *127.0.0.1*|*localhost*)
                 echo "BUILD_PROXY_URL 不能是 127.0.0.1/localhost：构建容器里的回环地址是容器自己。"
-                echo "请改成宿主机可达地址，例如 docker0 网关 http://172.17.0.1:7897"
+                echo "请改成宿主机可达地址，例如 docker0 网关 http://172.17.0.1:7890"
                 exit 1
                 ;;
             esac

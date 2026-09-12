@@ -73,7 +73,7 @@ jenkins 用户可 `sudo -u root docker`、可直接用 `kubectl`（ServiceAccoun
 
 | 参数 | 默认 | 说明 |
 | --- | --- | --- |
-| `USE_PROXY` / `PROXY_URL` | true / `http://127.0.0.1:7897` | 拉 GitHub 代码走代理，等价于本机的 `proxy_on` |
+| `USE_PROXY` / `PROXY_URL` | true / `http://127.0.0.1:7890` | 拉 GitHub 代码走代理，等价于本机的 `proxy_on` |
 | `BUILD_PROXY_URL` | 空 | `docker build` 内部 apt/pip 用的代理，⚠️ 不能填 127.0.0.1 |
 | `IMAGE_SMOKE_TEST` | true | 推送前先在构建机本地跑一遍镜像并真实调用 `/score` |
 | `ROLLOUT_TIMEOUT` | 600s | 镜像约 1.7G，节点首次 pull 慢 |
@@ -85,7 +85,7 @@ jenkins 用户可 `sudo -u root docker`、可直接用 `kubectl`（ServiceAccoun
 
 - Jenkins 为读取本文件做的那次 clone 发生在流水线开始之前 —— 需在
   `Manage Jenkins → System → Global properties → Environment variables` 配置 `http_proxy`/`https_proxy`/`no_proxy`，
-  或执行 `git config --global http.https://github.com.proxy http://127.0.0.1:7897`。
+  或执行 `git config --global http.https://github.com.proxy http://127.0.0.1:7890`。
 - 基础镜像 `bvlc/caffe:cpu` 由 dockerd 拉取 —— 需配置 `/etc/systemd/system/docker.service.d/http-proxy.conf`。
 
 ##### 3. 手动发布
